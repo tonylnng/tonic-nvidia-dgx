@@ -1,0 +1,244 @@
+# ============================================================================
+# Tonic NVIDIA DGX Spark (GB10) — full stack
+# Targets ARM64 + SM 12.1 + 128 GB unified LPDDR5x.
+# All listening ports bind to 127.0.0.1; external access is via Tailscale.
+# ============================================================================
+name: tonic-nvidia-dgx
+
+x-vllm-common: &vllm-common
+  image: ${VLLM_IMAGE}
+  platform: linux/arm64
+  restart: unless-stopped
+  runtime: nvidia
+  ipc: host
+  shm_size: "8g"
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  environment:
+    HF_TOKEN: ${HF_TOKEN}
+    VLLM_ATTENTION_BACKEND: FLASHINFER
+    VLLM_USE_TRITON_FLASH_ATTN: "1"
+    TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+    CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    NCCL_CUMEM_ENABLE: "0"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    HF_HUB_ENABLE_HF_TRANSFER: "1"
+  volumes:
+    - ${HF_CACHE_DIR:-/data/huggingface}:/root/.cache/huggingface
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    platform: linux/arm64
+    container_name: tonic-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ${POSTGRES_DATA_DIR:-/data/postgres}:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [tonic]
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: ${REDIS_IMAGE}
+    platform: linux/arm64
+    container_name: tonic-redis
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "yes"]
+    volumes:
+      - ${REDIS_DATA_DIR:-/data/redis}:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [tonic]
+
+  # ── LiteLLM Gateway ────────────────────────────────────────────────────────
+  litellm:
+    image: ${LITELLM_IMAGE}
+    platform: linux/arm64
+    container_name: tonic-litellm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-none}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-none}
+      STORE_MODEL_IN_DB: "True"
+    volumes:
+      - ./config/litellm_config.yaml:/app/config.yaml:ro
+      - ${LITELLM_LOGS_DIR:-/data/litellm-logs}:/var/log/litellm
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+      - "--num_workers"
+      - "4"
+      - "--telemetry"
+      - "False"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/health/liveliness || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [tonic]
+
+  # ── vLLM Backend A — Qwen3.5-122B-FP8 ─────────────────────────────────────
+  vllm-qwen-main:
+    <<: *vllm-common
+    container_name: tonic-vllm-qwen-main
+    ports:
+      - "127.0.0.1:8001:8000"
+    command:
+      - "--model"
+      - "Qwen/Qwen3.5-122B-A10B-FP8"
+      - "--served-model-name"
+      - "qwen-main"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "32768"
+      - "--gpu-memory-utilization"
+      - "0.70"
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--enable-chunked-prefill"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--max-num-seqs"
+      - "32"
+      - "--num-scheduler-steps"
+      - "8"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "hermes"
+      - "--disable-log-requests"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    networks: [tonic]
+
+  # ── vLLM Backend B — Qwen Vision (NVFP4) ──────────────────────────────────
+  vllm-qwen-vision:
+    <<: *vllm-common
+    container_name: tonic-vllm-qwen-vision
+    ports:
+      - "127.0.0.1:8002:8000"
+    command:
+      - "--model"
+      - "nvidia/Qwen2.5-VL-7B-Instruct-FP4"
+      - "--served-model-name"
+      - "qwen-vision"
+      - "--quantization"
+      - "modelopt"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "32768"
+      - "--gpu-memory-utilization"
+      - "0.20"
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--enable-chunked-prefill"
+      - "--max-num-batched-tokens"
+      - "4096"
+      - "--max-num-seqs"
+      - "16"
+      - "--trust-remote-code"
+      - "--limit-mm-per-prompt"
+      - "image=6,video=1"
+      - "--disable-log-requests"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks: [tonic]
+
+  # ── vLLM Backend C — Gemma4-31B-NVFP4 ─────────────────────────────────────
+  vllm-gemma-fast:
+    <<: *vllm-common
+    container_name: tonic-vllm-gemma-fast
+    ports:
+      - "127.0.0.1:8003:8000"
+    command:
+      - "--model"
+      - "nvidia/Gemma-4-31B-IT-NVFP4"
+      - "--served-model-name"
+      - "gemma-fast"
+      - "--quantization"
+      - "modelopt"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "131072"
+      - "--gpu-memory-utilization"
+      - "0.30"
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--enable-chunked-prefill"
+      - "--max-num-batched-tokens"
+      - "4096"
+      - "--max-num-seqs"
+      - "64"
+      - "--num-scheduler-steps"
+      - "8"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "gemma4"
+      - "--language-model-only"
+      - "--trust-remote-code"
+      - "--disable-log-requests"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 150s
+    networks: [tonic]
+
+networks:
+  tonic:
+    name: tonic-net
+    driver: bridge

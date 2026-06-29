@@ -1,0 +1,25 @@
+# Secrets
+.env
+*.local
+config/image-versions.env.bak
+
+# Backups (DB dumps, archived weights)
+backups/
+*.pgdump
+
+# Logs
+*.log
+docs/benchmarks/*.txt
+!docs/benchmarks/baseline-*.txt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python (any helper venvs)
+__pycache__/
+*.pyc
+.venv/
+venv/

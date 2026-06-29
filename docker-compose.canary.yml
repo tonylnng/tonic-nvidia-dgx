@@ -1,0 +1,40 @@
+# ============================================================================
+# Canary overlay — runs a parallel set of vLLM backends on alternate ports
+# using a NEW image digest, so production traffic on :8001/:8002/:8003 is
+# unaffected while you validate the new image.
+#
+# Usage:
+#   VLLM_IMAGE_CANARY=hellohal2064/vllm-dgx-spark-gb10:v0.18.0 \
+#     docker compose -f docker-compose.yml -f docker-compose.canary.yml \
+#     up -d vllm-qwen-main-canary
+# ============================================================================
+name: tonic-nvidia-dgx
+
+services:
+
+  vllm-qwen-main-canary:
+    extends:
+      file: docker-compose.yml
+      service: vllm-qwen-main
+    image: ${VLLM_IMAGE_CANARY}
+    container_name: tonic-vllm-qwen-main-canary
+    ports:
+      - "127.0.0.1:8011:8000"
+
+  vllm-qwen-vision-canary:
+    extends:
+      file: docker-compose.yml
+      service: vllm-qwen-vision
+    image: ${VLLM_IMAGE_CANARY}
+    container_name: tonic-vllm-qwen-vision-canary
+    ports:
+      - "127.0.0.1:8012:8000"
+
+  vllm-gemma-fast-canary:
+    extends:
+      file: docker-compose.yml
+      service: vllm-gemma-fast
+    image: ${VLLM_IMAGE_CANARY}
+    container_name: tonic-vllm-gemma-fast-canary
+    ports:
+      - "127.0.0.1:8013:8000"

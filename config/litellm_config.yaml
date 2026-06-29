@@ -1,0 +1,108 @@
+# ============================================================================
+# LiteLLM Proxy configuration — Tonic NVIDIA DGX Spark (GB10)
+# Three local vLLM backends + optional cloud fallbacks.
+# Docs: https://docs.litellm.ai/docs/proxy/configs
+# ============================================================================
+
+model_list:
+
+  # ── Backend A — General reasoning, coding, EN/ZH ───────────────────────────
+  - model_name: qwen-main
+    litellm_params:
+      model: openai/qwen-main
+      api_base: http://vllm-qwen-main:8000
+      api_key: "sk-no-key-needed"
+      timeout: 600
+      stream_timeout: 600
+    model_info:
+      mode: chat
+      supports_function_calling: true
+      supports_parallel_function_calling: true
+      max_tokens: 32768
+
+  # ── Backend B — Multimodal vision ──────────────────────────────────────────
+  - model_name: qwen-vision
+    litellm_params:
+      model: openai/qwen-vision
+      api_base: http://vllm-qwen-vision:8000
+      api_key: "sk-no-key-needed"
+      timeout: 300
+      stream_timeout: 300
+    model_info:
+      mode: chat
+      supports_vision: true
+      max_tokens: 32768
+
+  # ── Backend C — Fast, 128K-context, tool-calling ───────────────────────────
+  - model_name: gemma-fast
+    litellm_params:
+      model: openai/gemma-fast
+      api_base: http://vllm-gemma-fast:8000
+      api_key: "sk-no-key-needed"
+      timeout: 600
+      stream_timeout: 600
+    model_info:
+      mode: chat
+      supports_function_calling: true
+      max_tokens: 131072
+
+  # ── Optional cloud fallbacks ──────────────────────────────────────────────
+  # Uncomment after setting OPENAI_API_KEY / ANTHROPIC_API_KEY in .env.
+  #
+  # - model_name: gpt-premium
+  #   litellm_params:
+  #     model: gpt-4.1
+  #     api_key: os.environ/OPENAI_API_KEY
+  #
+  # - model_name: claude-premium
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-4-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+
+# ─── Router / fallback behaviour ────────────────────────────────────────────
+router_settings:
+  routing_strategy: usage-based-routing-v2
+  num_retries: 2
+  retry_after: 5
+  allowed_fails: 3
+  cooldown_time: 30
+  enable_pre_call_checks: true
+  # Per-model fallbacks: if local is down, switch to cloud (when configured)
+  fallbacks:
+    - qwen-main: ["gemma-fast"]
+    - gemma-fast: ["qwen-main"]
+    - qwen-vision: []          # no local fallback for vision
+
+# ─── General proxy settings ─────────────────────────────────────────────────
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  database_connection_pool_limit: 10
+  store_model_in_db: true
+  ui_access_mode: admin_only
+  proxy_budget_rescheduler_min_time: 60
+  proxy_budget_rescheduler_max_time: 64
+  alerting: ["slack"]
+  alerting_threshold: 300       # seconds — alert if a request hangs >5min
+
+# ─── LiteLLM core settings ──────────────────────────────────────────────────
+litellm_settings:
+  request_timeout: 600
+  set_verbose: false
+  drop_params: true
+  json_logs: true
+  redact_user_api_key_info: true
+  # Redis caching for identical prompts within 10 min
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    ttl: 600
+    supported_call_types: ["acompletion", "completion"]
+  # Default rate limits applied to every new virtual key unless overridden
+  default_internal_user_params:
+    max_budget: 100.0
+    budget_duration: 30d
+    tpm_limit: 50000
+    rpm_limit: 60
