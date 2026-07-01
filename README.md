@@ -8,28 +8,82 @@
 
 ---
 
-## ⚠️ Critical Hardware Note — Read Before Anything Else
+## GB10 Platform at a Glance
 
-The original draft of this guide assumed a multi-GPU **DGX H100/H200** data-center node. The real deployment target is a **DGX Spark with the GB10 Superchip**, which has fundamentally different characteristics. Every command, image tag, and tuning parameter in this manual has been re-validated for GB10.
+This manual targets a single **NVIDIA DGX Spark** built on the **GB10 Grace Blackwell Superchip**. Every command, image tag, and tuning parameter has been validated for this hardware.
 
-| Attribute | DGX H100/H200 (original draft) | **DGX Spark GB10 (this manual)** |
-|-----------|--------------------------------|----------------------------------|
-| Architecture | x86_64 + 8× discrete GPU | **ARM64 (aarch64) + 1× integrated Blackwell GPU** |
-| Compute capability | SM 9.0 (Hopper) / SM 10.0 (Blackwell B200) | **SM 12.1 (Blackwell consumer)** |
-| Memory model | Discrete HBM3 (80–141 GB / GPU) | **128 GB LPDDR5x unified, coherent (CPU + GPU share one pool)** |
-| Memory bandwidth | 3.3–4.8 TB/s HBM3 | **273 GB/s LPDDR5x** |
-| `nvidia-smi` VRAM | Reports per-GPU HBM | **Reports `N/A` — read `free -h` instead** |
-| Tensor parallel size | 4–8 | **1 (single GPU)** |
-| CUDA requirement | 12.x or 13.x | **13.x mandatory (CUDA 12.x incompatible with SM 12.1)** |
-| vLLM image | `vllm/vllm-openai:latest` | **GB10/aarch64-specific build required** |
-| Max model size | 235B+ dense | **~120B FP8, ~200B NVFP4 (practical ceiling)** |
+| Attribute | Value |
+|-----------|-------|
+| SoC | GB10 Grace Blackwell Superchip (ARM64 / aarch64) |
+| GPU compute capability | SM 12.1 (Blackwell, consumer-class tensor cores with native FP4) |
+| Peak AI compute | ~1 PFLOPS sparse FP4 (~500 TFLOPS dense FP4) ([NVIDIA DGX Spark hardware docs](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)) |
+| Memory model | 128 GB LPDDR5x, unified and coherent (CPU + GPU share one pool) |
+| Usable memory | ~119–122 GiB visible to CUDA after OS reservation ([Rafay benchmarks](https://rafay.co/ai-and-cloud-native-blog/serving-llms-on-arm-running-rafay-token-factory-on-nvidia-dgx-spark)) |
+| Memory bandwidth | **273 GB/s** (this is the ceiling that governs decode speed) |
+| CUDA | 13.x mandatory (CUDA 12.x does not support SM 12.1) |
+| Tensor parallelism | 1 (single integrated GPU); scale-out only via ConnectX-7 to a second Spark |
+| `nvidia-smi` memory column | Reports `N/A` on unified memory — use `free -h` instead |
 
-**Practical consequences for this stack:**
+**Design rules that follow from this hardware:**
 
-- **Backend B (Qwen3-VL-235B) cannot run as drafted** — it needs ≥320 GB VRAM. We replace it with a GB10-feasible vision model (Qwen2.5-VL-7B-FP4 or Qwen3-VL-32B-FP4) by default, with notes for swapping in a larger NVFP4 variant if you also link a second Spark over ConnectX-7.
-- **All `tensor-parallel-size` flags are 1.**
-- **`--gpu-memory-utilization` semantics are different** — it carves out of the *shared* 128 GB pool. Set it lower than on H100 to leave headroom for the OS and ARM CPU workload (recommended 0.65–0.75 per backend, with the sum across concurrent backends ≤ 0.85).
-- **Backends run sequentially or share memory** — running Qwen3.5-122B + Gemma4-31B + Vision together at full context is *not* possible. Use the model-swap pattern in [§12 Maintenance](#12-maintenance-routine--model-updates) or LiteLLM cold-routing.
+- vLLM `--tensor-parallel-size 1` everywhere.
+- Prefer **NVFP4** > FP8 > FP16 wherever a checkpoint exists — the platform is memory-bandwidth-bound, so every bit shaved off weights and KV directly buys tokens/sec.
+- `--kv-cache-dtype fp8` is not optional in production — it is the single biggest throughput knob.
+- `--gpu-memory-utilization` carves out of the *shared* 128 GB pool; set per backend, and keep the **sum of concurrent backends ≤ 0.85** to leave headroom for the ARM CPU, the OS, and page cache.
+- Running the full three-backend stack (Qwen3.5-122B + Gemma4-31B + Vision) at maximum context simultaneously is not memory-feasible; use LiteLLM cold-routing or the `scripts/swap.sh` pattern in [§12](#12-maintenance-routine--model-updates).
+
+---
+
+## Model Capacity on GB10 — What Actually Fits & How Fast
+
+The 128 GB unified pool is generous — models that would need a multi-GPU box in HBM will *load* here. But the **273 GB/s** LPDDR5x bandwidth caps decode (token-generation) speed to roughly `bandwidth ÷ weight_bytes_read_per_token`. NVIDIA's official ceiling is **200B parameters at FP4 on one Spark**, and **405B across two Sparks** linked by ConnectX-7 ([NVIDIA DGX Spark datasheet, TD Synnex PDF](https://www.tdsynnex.com/na/us/nvidia/wp-content/uploads/sites/81/2025/08/workstation-datasheet-dgx-spark-gtc25-spring-partner-us-4015500-r1.pdf)). Whether it is *usable* at that ceiling depends on decode throughput.
+
+A reasonable rule of thumb, from community benchmarks:
+
+> Anything **≥ 25 tok/s** decode feels responsive for interactive chat.
+> **10–25 tok/s** is acceptable for reasoning and long-form generation.
+> **< 10 tok/s** is batch-only.
+
+### Recommended sweet-spots for this deployment
+
+| Tier | Model class | Precision | Loaded size | Decode tok/s (1 stream) | Verdict on GB10 |
+|------|-------------|-----------|------------:|------------------------:|-----------------|
+| S — Interactive | Nemotron-3-Nano-4B / Llama 3.1 8B | FP8 / NVFP4 | ~4–8 GB | ~40–70 (batch 1) → **~368 (batch 32)** | Real-time chat, orchestration, routing |
+| S — Interactive | Qwen3-VL-30B-A3B (MoE, ~3B active) | FP8 | ~30 GB | ~52 | Excellent vision + chat |
+| M — Balanced | Qwen3.5-35B / Nemotron-3-30B-A3B MoE | NVFP4 | ~20–35 GB | ~50–66 | The GB10 comfort zone |
+| M — Balanced | Gemma4-31B / Qwen3 32B | NVFP4 | ~22 GB | ~50–60 | Great for long-context (131K) tool calling |
+| **L — Sweet spot** | **GPT-OSS-120B (MoE, ~5B active)** | **MXFP4** | **~65–70 GB** | **~56–60 single stream; ~125 aggregate at 10 concurrent** | **Best 120B option on a single Spark by a wide margin** |
+| L — Reasoning | **Qwen3.5-122B-A10B (MoE, ~10B active)** | FP8 / INT4 AutoRound | ~80–90 GB | ~38–42 (FP8, 1 stream); ~25 per request at concurrency 4 | Usable for reasoning; slower than GPT-OSS-120B because 10B active > 5B active |
+| L — Reasoning | Nemotron-3-Super-120B-A12B | NVFP4 | ~65 GB | ~14 | Runs, but slow — reserve for batch |
+| XL — Ceiling | Dense 70B (Llama 3.1 70B FP8) | FP8 | ~70 GB | **~2.7** | Loads fine, decode too slow for chat |
+| XL — Ceiling | Qwen3 200B / DeepSeek-R1 quantized | NVFP4 / Q4 | ~110–120 GB | 5–15 (project-dependent) | Fits at NVFP4; single-stream only; near the ceiling |
+| Out of scope | Dense ≥ 200B (e.g. Qwen3-VL-235B FP16) | FP16 / FP8 | > 128 GB | — | Does not fit; needs 2-Spark cluster or cloud |
+
+> **Data sources (measured, not marketing):** LMSYS DGX Spark deep-dive with SGLang and Ollama ([lmsys.org](https://www.lmsys.org/blog/2025-10-13-nvidia-dgx-spark/)); NVIDIA Developer Forums — LiteLLM + llama-swap + vLLM stack benchmarks by @eugr with `llama-benchy` ([forums.developer.nvidia.com](https://forums.developer.nvidia.com/t/running-a-full-llm-stack-on-dgx-spark-gb10-your-application-litellm-llama-swap-vllm-llama-cpp-ollama/367580)); Exxact model-by-model throughput table ([exxactcorp.com](https://www.exxactcorp.com/blog/hpc/nvidia-dgx-spark-ai-supercomputer-wherever-you-go)); vLLM-on-GB10 tuning writeup at [ai-muninn.com](https://ai-muninn.com/en/blog/part2-gpt-oss-120b-serve-script); Cline SIGKILL-race analysis ([cline.ghost.io](https://cline.ghost.io/what-a-sigkill-race-reveals-about-inference-speed/)).
+
+### Why the 120B MoE tier is the sweet spot
+
+Decode speed on GB10 is set by *how many bytes of weight get read per token*. Dense models read the whole model per token; **Mixture-of-Experts (MoE)** models read only the active experts, so a 120B MoE with 5B active behaves closer to a 5B dense model on the memory bus while keeping the quality of a 120B parameter count. Concretely:
+
+- **GPT-OSS-120B (MoE, MXFP4, ~5B active)** → ~56–60 tok/s single stream, ~125 tok/s aggregate at 10 concurrent requests ([NVIDIA Developer Forums](https://forums.developer.nvidia.com/t/dgx-spark-the-sovereign-ai-stack-dual-model-architecture-for-local-inference/352267))
+- **Qwen3.5-122B-A10B (MoE, ~10B active, FP8)** → ~40 tok/s single stream, ~25 tok/s per request at concurrency 4 ([NVIDIA Developer Forums bfloat16/MTP benchmark](https://forums.developer.nvidia.com/t/bfloat16-quality-speed/366828))
+- **Llama 3.1 70B (dense, FP8)** → **~2.7 tok/s** — reads the full 70 GB per token; effectively unusable for chat ([LMSYS](https://www.lmsys.org/blog/2025-10-13-nvidia-dgx-spark/))
+
+### Practical picks for this stack
+
+| Role | Recommended default | Alternative for max quality | Alternative for max speed |
+|------|---------------------|-----------------------------|---------------------------|
+| Main reasoning / coding (EN & ZH) | **Qwen3.5-122B-A10B FP8** | Qwen3.5-122B INT4 AutoRound (~90 GB, similar quality, lower memory) | **GPT-OSS-120B MXFP4** (faster; different tone) |
+| Fast tool-calling, 128K context | **Gemma4-31B NVFP4** | Qwen3 32B NVFP4 | Nemotron-3-30B-A3B MoE (~66 tok/s) |
+| Multimodal vision | **Qwen2.5-VL-7B-FP4** (~7 GB, quick) | Qwen3-VL-30B-A3B FP8 (~52 tok/s, better vision) | Same |
+| Small routing / classification | Llama 3.1 8B NVFP4 | Nemotron-3-Nano-4B FP8 | Same |
+
+### When you need bigger than 128 GB
+
+Two paths, in order of preference:
+
+1. **2-Spark cluster over ConnectX-7 (200 GbE):** reaches ~256 GB unified across the pair; enables NVFP4 models up to ~405B. Qwen3-235B NVFP4 has been measured at ~23,477 tok/s prefill and ~11.7 tok/s decode on dual Spark ([Exxact](https://www.exxactcorp.com/blog/hpc/nvidia-dgx-spark-ai-supercomputer-wherever-you-go)).
+2. **LiteLLM cloud fallback** — keep a `gpt-premium` / `claude-premium` alias in `config/litellm_config.yaml` for the rare requests that exceed local capacity.
 
 ---
 
