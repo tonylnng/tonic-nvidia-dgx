@@ -26,6 +26,9 @@ x-vllm-common: &vllm-common
     HF_HUB_ENABLE_HF_TRANSFER: "1"
   volumes:
     - ${HF_CACHE_DIR:-/data/huggingface}:/root/.cache/huggingface
+    # Manually-downloaded models live under /data/huggingface/manual on the host
+    # and are visible inside the container as /models. See docs/MANUAL_MODEL_UPLOAD.md.
+    - ${MANUAL_MODELS_DIR:-/data/huggingface/manual}:/models:ro
   deploy:
     resources:
       reservations:
@@ -114,7 +117,10 @@ services:
       start_period: 30s
     networks: [tonic]
 
-  # ── vLLM Backend A — Qwen3.5-122B-FP8 ─────────────────────────────────────
+  # ── vLLM Backend A — Qwen3-30B-A3B-FP8 (MoE, ~3B active) ──────────────────
+  # Default is a manually-downloaded model at /data/huggingface/manual/Qwen3-30B-A3B-FP8
+  # See docs/MANUAL_MODEL_UPLOAD.md for how to place the files.
+  # To use a larger model instead (e.g. 122B), set QWEN_MAIN_MODEL in .env.
   vllm-qwen-main:
     <<: *vllm-common
     container_name: tonic-vllm-qwen-main
@@ -122,7 +128,7 @@ services:
       - "127.0.0.1:8001:8000"
     command:
       - "--model"
-      - "Qwen/Qwen3.5-122B-A10B-FP8"
+      - "${QWEN_MAIN_MODEL:-/models/Qwen3-30B-A3B-FP8}"
       - "--served-model-name"
       - "qwen-main"
       - "--tensor-parallel-size"
@@ -130,14 +136,14 @@ services:
       - "--max-model-len"
       - "32768"
       - "--gpu-memory-utilization"
-      - "0.70"
+      - "${QWEN_MAIN_MEM_UTIL:-0.30}"
       - "--kv-cache-dtype"
       - "fp8"
       - "--enable-chunked-prefill"
       - "--max-num-batched-tokens"
       - "8192"
       - "--max-num-seqs"
-      - "32"
+      - "64"
       - "--num-scheduler-steps"
       - "8"
       - "--enable-auto-tool-choice"
@@ -162,7 +168,7 @@ services:
       - "127.0.0.1:8002:8000"
     command:
       - "--model"
-      - "nvidia/Qwen2.5-VL-7B-Instruct-FP4"
+      - "${QWEN_VISION_MODEL:-/models/Qwen2.5-VL-7B-Instruct-FP4}"
       - "--served-model-name"
       - "qwen-vision"
       - "--quantization"
@@ -202,7 +208,7 @@ services:
       - "127.0.0.1:8003:8000"
     command:
       - "--model"
-      - "nvidia/Gemma-4-31B-IT-NVFP4"
+      - "${GEMMA_FAST_MODEL:-/models/Gemma-4-31B-IT-NVFP4}"
       - "--served-model-name"
       - "gemma-fast"
       - "--quantization"

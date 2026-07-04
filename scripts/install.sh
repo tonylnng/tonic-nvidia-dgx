@@ -26,8 +26,10 @@ set -a; . .env; set +a
   || { echo "Please change LITELLM_MASTER_KEY in .env"; exit 1; }
 
 bold "3/7 Prepare /data directories"
-sudo mkdir -p /data/huggingface /data/postgres /data/redis /data/litellm-logs
-sudo chown -R "$(id -u):$(id -g)" /data/huggingface /data/litellm-logs
+# Delegated to a dedicated helper so the same layout can be re-applied
+# without re-running the whole installer. Requires sudo the first time
+# to chown the tree to the invoking user; idempotent afterwards.
+./scripts/init-data-dirs.sh
 
 bold "4/7 Load pinned image versions"
 set -a; . config/image-versions.env; set +a
