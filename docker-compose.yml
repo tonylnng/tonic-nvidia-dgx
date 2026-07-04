@@ -85,7 +85,7 @@ services:
     container_name: tonic-litellm
     restart: unless-stopped
     ports:
-      - "127.0.0.1:4000:4000"
+      - "100.125.136.113:4000:4000"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
