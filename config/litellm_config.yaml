@@ -19,6 +19,18 @@ model_list:
       supports_parallel_function_calling: true
       max_tokens: 32768
 
+  - model_name: gemma-fast
+    litellm_params:
+      model: openai/gemma-fast
+      api_base: http://vllm-gemma-fast:8000/v1
+      api_key: "fake-key"
+      timeout: 600
+      stream_timeout: 600
+    model_info:
+      mode: chat
+      supports_function_calling: true
+      max_tokens: 32768
+
 router_settings:
   routing_strategy: simple-shuffle
   num_retries: 1
