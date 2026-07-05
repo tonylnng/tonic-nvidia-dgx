@@ -1,7 +1,7 @@
 # ============================================================================
 # LiteLLM Proxy — Tonic DGX Spark (GB10)
 # Phase 1: qwen-main (Qwen3-30B-A3B) only.
-# Add qwen-vision and gemma-fast when their models are downloaded.
+# Add qwen-vision and gemma4-31b when their models are downloaded.
 # ============================================================================
 
 model_list:
@@ -19,10 +19,10 @@ model_list:
       supports_parallel_function_calling: true
       max_tokens: 32768
 
-  - model_name: gemma-fast
+  - model_name: gemma4-31b
     litellm_params:
-      model: openai/gemma-fast
-      api_base: http://vllm-gemma-fast:8000/v1
+      model: openai/gemma4-31b
+      api_base: http://vllm-gemma4-31b:8000/v1
       api_key: "fake-key"
       timeout: 600
       stream_timeout: 600

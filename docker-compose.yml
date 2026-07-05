@@ -211,10 +211,10 @@ services:
   # ⚠️ BLOCKED: requires transformers 5.x + vLLM with Gemma4 registry
   # Current image (hellohal2064/vllm-dgx-spark-gb10:latest, Feb 2026) only supports Gemma3.
   # Re-enable when image is updated.
-  vllm-gemma-fast:
+  vllm-gemma4-31b:
     <<: *vllm-common
     profiles: ["optional"]
-    container_name: tonic-vllm-gemma-fast
+    container_name: tonic-vllm-gemma4-31b
     ports:
       - "127.0.0.1:8003:8000"
     environment:
@@ -227,16 +227,16 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       HF_HUB_ENABLE_HF_TRANSFER: "1"
       # hellohal2064 entrypoint env vars
-      MODEL_PATH: "${GEMMA_FAST_MODEL:-/models/gemma-4-31B-it}"
+      MODEL_PATH: "${GEMMA4_31B_MODEL:-/models/gemma-4-31B-it}"
       HOST: "0.0.0.0"
       PORT: "8000"
       MAX_MODEL_LEN: "32768"
-      GPU_MEMORY_UTIL: "${GEMMA_FAST_MEM_UTIL:-0.50}"
+      GPU_MEMORY_UTIL: "${GEMMA4_31B_MEM_UTIL:-0.50}"
       ATTENTION_BACKEND: FLASHINFER
       TOOL_CALL_PARSER: hermes
     command:
       - "--served-model-name"
-      - "gemma-fast"
+      - "gemma4-31b"
       - "--tensor-parallel-size"
       - "1"
       - "--kv-cache-dtype"
