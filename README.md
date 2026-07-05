@@ -2,10 +2,10 @@
 
 > **Repository:** [tonylnng/tonic-nvidia-dgx](https://github.com/tonylnng/tonic-nvidia-dgx)
 > **Target Hardware:** NVIDIA DGX Spark — GB10 Grace Blackwell Superchip (ARM64, SM 12.1, 128 GB unified LPDDR5x)
-> **Stack:** LiteLLM Gateway · vLLM Backend A (Qwen3-30B-A3B-FP8) · vLLM Backend B (Qwen2.5-VL-7B-FP4) · vLLM Backend C (Gemma4-31B-NVFP4)
-> **Model delivery:** manually downloaded from HF web UI → rsync to `/data/huggingface/manual/` → mounted read-only as `/models` inside every vLLM container. See [docs/MANUAL_MODEL_UPLOAD.md](docs/MANUAL_MODEL_UPLOAD.md).
+> **Stack:** LiteLLM Gateway · vLLM Backend A `qwen-main` (Qwen3-30B-A3B, active) · vLLM Backend B `qwen-vision` (Qwen2.5-VL, optional / not yet downloaded) · vLLM Backend C `gemma4-31b` (Gemma4-31B-IT, optional / pending FP8 CUTLASS fix)
+> **Model delivery:** manually downloaded from HF web UI → rsync to `/data/huggingface/manual/` → mounted read-only as `/models` inside every vLLM container. See [docs/MANUAL_MODEL_UPLOAD.md](docs/MANUAL_MODEL_UPLOAD.md) and the operational reference [docs/VLLM-SETUP.md](docs/VLLM-SETUP.md).
 > **Network:** Tailscale-only access (no public exposure)
-> **Last Updated:** June 2026
+> **Last Updated:** July 2026
 
 ---
 
@@ -30,8 +30,8 @@ This manual targets a single **NVIDIA DGX Spark** built on the **GB10 Grace Blac
 - vLLM `--tensor-parallel-size 1` everywhere.
 - Prefer **NVFP4** > FP8 > FP16 wherever a checkpoint exists — the platform is memory-bandwidth-bound, so every bit shaved off weights and KV directly buys tokens/sec.
 - `--kv-cache-dtype fp8` is not optional in production — it is the single biggest throughput knob.
-- `--gpu-memory-utilization` carves out of the *shared* 128 GB pool; set per backend, and keep the **sum of concurrent backends ≤ 0.85** to leave headroom for the ARM CPU, the OS, and page cache.
-- Running the full three-backend stack (Qwen3.5-122B + Gemma4-31B + Vision) at maximum context simultaneously is not memory-feasible; use LiteLLM cold-routing or the `scripts/swap.sh` pattern in [§12](#12-maintenance-routine--model-updates).
+- `--gpu-memory-utilization` carves out of the *shared* 128 GB pool; set per backend, and keep the **active backend ≤ 0.85** to leave headroom for the ARM CPU, the OS, and page cache.
+- **The GB10 cannot run two vLLM instances simultaneously in production.** Model weights alone consume 30–110 GiB depending on the model, and two live containers cause OOM hangs during KV warm-up. Only **one** of `vllm-qwen-main` / `vllm-qwen-vision` / `vllm-gemma4-31b` runs at a time; swap with `docker stop` → `docker compose up -d <other>` (see [§6.4](#64-running-only-one-vllm-at-a-time)) or the `scripts/swap.sh` pattern in [§12](#12-maintenance-routine--model-updates).
 
 ---
 
@@ -96,9 +96,10 @@ Two paths, in order of preference:
 4. [Prerequisites — GB10 Spark Specifics](#4-prerequisites--gb10-spark-specifics)
 5. [Installation SOP — Step by Step](#5-installation-sop--step-by-step)
 6. [vLLM Backend Configuration](#6-vllm-backend-configuration)
-   - [6.1 Backend A — Qwen3-30B-A3B-FP8](#61-backend-a--qwen3-30b-a3b-fp8)
-   - [6.2 Backend B — Qwen Vision (NVFP4)](#62-backend-b--qwen-vision-nvfp4)
-   - [6.3 Backend C — Gemma4-31B-NVFP4](#63-backend-c--gemma4-31b-nvfp4)
+   - [6.1 Backend A — Qwen3-30B-A3B (`qwen-main`)](#61-backend-a--qwen3-30b-a3b-qwen-main)
+   - [6.2 Backend B — Qwen2.5-VL (`qwen-vision`)](#62-backend-b--qwen25-vl-qwen-vision)
+   - [6.3 Backend C — Gemma4-31B-IT (`gemma4-31b`)](#63-backend-c--gemma4-31b-it-gemma4-31b)
+   - [6.4 Running only one vLLM at a time](#64-running-only-one-vllm-at-a-time)
 7. [LiteLLM Gateway Configuration](#7-litellm-gateway-configuration)
 8. [Docker Compose — Full Stack](#8-docker-compose--full-stack)
 9. [Version Control Strategy for vLLM Images](#9-version-control-strategy-for-vllm-images)
@@ -132,9 +133,9 @@ graph TB
     end
 
     subgraph Spark["NVIDIA DGX Spark GB10 — vLLM Backends"]
-        B1[Backend A<br/>Qwen3-30B-A3B-FP8<br/>MoE ~3B active · :8001]
-        B2[Backend B<br/>Qwen-Vision-NVFP4<br/>:8002]
-        B3[Backend C<br/>Gemma4-31B-NVFP4<br/>:8003]
+        B1[Backend A<br/>Qwen3-30B-A3B<br/>MoE ~3B active · :8001<br/>active]
+        B2[Backend B<br/>Qwen2.5-VL<br/>:8002<br/>optional profile]
+        B3[Backend C<br/>Gemma4-31B-IT<br/>:8003<br/>optional profile]
         MEM[(128 GB Unified LPDDR5x<br/>shared by all backends)]
         B1 -.shared.- MEM
         B2 -.shared.- MEM
@@ -186,39 +187,43 @@ classDiagram
 
     class vLLM_A {
         +port: 8001
-        +model: /models/Qwen3-30B-A3B-FP8 (manual upload)
-        +image: GB10 ARM64 vLLM build
+        +model: /models/Qwen3-30B-A3B (manual upload)
+        +image: hellohal2064/vllm-dgx-spark-gb10
         +quantization: FP8 (MoE, ~3B active)
         +tensor_parallel: 1
         +context_length: 32768
-        +gpu_memory_utilization: 0.30
+        +gpu_memory_utilization: 0.60
+        +kv_cache_dtype: fp8
+        +status: active (default)
     }
 
     class vLLM_B {
         +port: 8002
-        +model: nvidia/Qwen2.5-VL-7B-Instruct-FP4
-        +image: GB10 ARM64 NVFP4 build
+        +model: /models/Qwen2.5-VL-7B-Instruct
+        +image: hellohal2064/vllm-dgx-spark-gb10
         +type: multimodal vision
         +tensor_parallel: 1
         +context_length: 32768
         +gpu_memory_utilization: 0.20
+        +status: optional (pending download)
     }
 
     class vLLM_C {
         +port: 8003
-        +model: nvidia/Gemma-4-31B-IT-NVFP4
-        +image: GB10 ARM64 NVFP4 build
-        +quantization: NVFP4 (modelopt)
+        +model: /models/gemma-4-31B-it
+        +image: vllm/vllm-openai:cu129-nightly-aarch64
+        +note: hellohal image only supports up to Gemma3
         +tensor_parallel: 1
-        +context_length: 131072
-        +gpu_memory_utilization: 0.30
+        +context_length: 32768
+        +gpu_memory_utilization: 0.35
+        +status: optional (blocked by FP8 CUTLASS crash)
     }
 
     LiteLLMProxy --> PostgreSQL : stores keys & usage
     LiteLLMProxy --> Redis : rate-limit state
     LiteLLMProxy --> vLLM_A : routes qwen-main
     LiteLLMProxy --> vLLM_B : routes qwen-vision
-    LiteLLMProxy --> vLLM_C : routes gemma-fast
+    LiteLLMProxy --> vLLM_C : routes gemma4-31b
 ```
 
 ---
@@ -309,7 +314,7 @@ Model cache and databases live on the internal 4 TB NVMe. Use the helper script:
 
 ```bash
 sudo mkdir -p /data                     # if it doesn't already exist
-sudo scripts/init-data-dirs.sh          # creates subdirs with correct perms
+./scripts/init-data-dirs.sh             # creates subdirs with correct perms (asks for sudo on first run)
 ```
 
 The script creates:
@@ -360,12 +365,14 @@ Required values are documented in [`.env.example`](.env.example).
 > Always pin to a digest in production. See [§9 Version Control Strategy](#9-version-control-strategy-for-vllm-images).
 
 ```bash
-# GB10-compatible vLLM image (ARM64 + SM 12.1 + CUDA 13)
-# Option A — NVIDIA NGC official (recommended once 25.06+ is GA for aarch64):
-docker pull nvcr.io/nvidia/vllm:25.06-py3
+# GB10-compatible vLLM image for Backends A and B (ARM64 + SM 12.1 + CUDA 13)
+# Community GB10 image — currently pinned in config/image-versions.env as VLLM_IMAGE.
+# It supports models up to Gemma3; for Gemma4 use the NVIDIA nightly below.
+docker pull hellohal2064/vllm-dgx-spark-gb10:latest
 
-# Option B — community GB10 image (faster track for SM 12.1 fixes):
-docker pull hellohal2064/vllm-dgx-spark-gb10:v0.17.1
+# vLLM nightly for Backend C — required because hellohal2064 does not yet ship
+# the Gemma4ForConditionalGeneration registry. Referenced directly in docker-compose.yml.
+docker pull vllm/vllm-openai:cu129-nightly-aarch64
 
 # LiteLLM (multi-arch)
 docker pull ghcr.io/berriai/litellm:main-stable
@@ -375,27 +382,29 @@ docker pull postgres:16-alpine
 docker pull redis:7-alpine
 ```
 
+> **After UAT**, replace the floating tag in [`config/image-versions.env`](config/image-versions.env) with a pinned `@sha256:` digest. See [§9](#9-version-control-strategy-for-vllm-images) for the promotion procedure. Note that `vllm-gemma4-31b` in `docker-compose.yml` intentionally references its image directly and does **not** consume `${VLLM_IMAGE}`.
+
 ### Step 4 — Place model files under `/data/huggingface/manual/`
 
 The default workflow is **manual upload from a machine with HF web access** — see the full guide in [`docs/MANUAL_MODEL_UPLOAD.md`](docs/MANUAL_MODEL_UPLOAD.md). Short version:
 
-1. On your laptop, browse each HF model page and download every file in the "Files and versions" root into a local folder named exactly like the model:
-   - [`Qwen/Qwen3-30B-A3B-FP8`](https://huggingface.co/Qwen/Qwen3-30B-A3B-FP8) → `~/Downloads/Qwen3-30B-A3B-FP8/` (~7 GB)
-   - [`nvidia/Qwen2.5-VL-7B-Instruct-FP4`](https://huggingface.co/nvidia/Qwen2.5-VL-7B-Instruct-FP4) → `~/Downloads/Qwen2.5-VL-7B-Instruct-FP4/` (~6 GB)
-   - [`nvidia/Gemma-4-31B-IT-NVFP4`](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) → `~/Downloads/Gemma-4-31B-IT-NVFP4/` (~22 GB)
+1. On your laptop, browse each HF model page and download every file in the "Files and versions" root into a local folder named exactly like the folder the compose file expects (no quant suffix in the folder name — vLLM reads the quant from the model's own `config.json`):
+   - [`Qwen/Qwen3-30B-A3B`](https://huggingface.co/Qwen/Qwen3-30B-A3B) → `~/Downloads/Qwen3-30B-A3B/` (~60 GB across 16 shards; the compose default runs this at FP8 KV cache)
+   - [`Qwen/Qwen2.5-VL-7B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) → `~/Downloads/Qwen2.5-VL-7B-Instruct/` (~16 GB; optional — pending download)
+   - [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) → `~/Downloads/gemma-4-31B-it/` (~62 GB BF16; optional — blocked, see §6.3)
 2. Upload to the Spark over Tailscale:
    ```bash
-   rsync -avhP ~/Downloads/Qwen3-30B-A3B-FP8/ \
-     tony@spark.<tailnet>.ts.net:/data/huggingface/manual/Qwen3-30B-A3B-FP8/
+   rsync -avhP ~/Downloads/Qwen3-30B-A3B/ \
+     tony@spark.<tailnet>.ts.net:/data/huggingface/manual/Qwen3-30B-A3B/
    ```
 3. Verify each upload on the Spark:
    ```bash
-   scripts/verify-model.sh /data/huggingface/manual/Qwen3-30B-A3B-FP8
+   scripts/verify-model.sh /data/huggingface/manual/Qwen3-30B-A3B
    ```
 
-`docker-compose.yml` mounts `/data/huggingface/manual` as `/models:ro` inside every vLLM container, so the default `--model /models/Qwen3-30B-A3B-FP8` picks up the folder automatically.
+`docker-compose.yml` mounts `/data/huggingface/manual` as `/models:ro` inside every vLLM container, so the default `MODEL_PATH=/models/Qwen3-30B-A3B` (see §6.1) picks up the folder automatically.
 
-> **If the Spark can reach HF directly** (and you have a valid `HF_TOKEN` in `.env`), you can skip the manual upload — override `QWEN_MAIN_MODEL=Qwen/Qwen3-30B-A3B-FP8` in `.env` and vLLM will fetch on first start.
+> **If the Spark can reach HF directly** (and you have a valid `HF_TOKEN` in `.env`), you can skip the manual upload — override `QWEN_MAIN_MODEL=Qwen/Qwen3-30B-A3B` in `.env` and vLLM will fetch on first start. In practice, direct HF pulls have been unreliable from this Spark, so manual upload is the recommended default.
 
 ### Step 5 — Bring up the stack
 
@@ -410,9 +419,9 @@ docker compose ps     # all services should be "Up" / "healthy"
 ./scripts/healthcheck.sh
 # Or manually:
 curl -sf http://localhost:8001/health && echo "qwen-main OK"
-curl -sf http://localhost:8002/health && echo "qwen-vision OK"
-curl -sf http://localhost:8003/health && echo "gemma-fast OK"
-curl -sf http://localhost:4000/health && echo "litellm OK"
+curl -sf http://localhost:8002/health && echo "qwen-vision OK"    # only if vllm-qwen-vision is running
+curl -sf http://localhost:8003/health && echo "gemma4-31b OK"      # only if vllm-gemma4-31b is running
+curl -sf http://localhost:4000/health && echo "litellm OK"         # see LiteLLM (unhealthy) note in §7
 ```
 
 ### Step 7 — Open the LiteLLM Admin UI
@@ -434,21 +443,33 @@ Login with `LITELLM_MASTER_KEY` from `.env`.
 > - `--max-num-batched-tokens 8192` (good GB10 default; tune per §10)
 > - `--swap-space 0` (DO NOT use; swap to LPDDR5x hurts the unified pool)
 > - `--enforce-eager false` (let CUDA graphs run — major Blackwell win)
+>
+> **`hellohal2064` image quirk** (applies to Backends A and C, since C also uses `hellohal2064` as its `<<: *vllm-common` template but overrides the image): the container entrypoint reads `MODEL_PATH`, `GPU_MEMORY_UTIL`, `MAX_MODEL_LEN`, `ATTENTION_BACKEND`, `TOOL_CALL_PARSER`, `REASONING_PARSER`, and `ENABLE_THINKING` from **env vars** — do **not** pass `--model` as the first CLI argument. The compose file already wires these correctly; standalone `docker run` examples below reflect the same pattern.
 
-### 6.1 Backend A — Qwen3-30B-A3B-FP8
+### 6.1 Backend A — Qwen3-30B-A3B (`qwen-main`)
 
-Default reasoning / coding backend. MoE architecture with only ~3B active parameters per token → ~90–130 tok/s decode on GB10, small download, and plenty of memory headroom to run all three backends concurrently.
+Default reasoning / coding backend and the **only vLLM container running by default**. MoE architecture with only ~3B active parameters per token → ~110–130 tok/s decode on GB10.
 
 | | |
 |---|---|
-| Model | `Qwen/Qwen3-30B-A3B-FP8` (MoE, ~3B active) |
-| Local path | `/models/Qwen3-30B-A3B-FP8` (mounted from `/data/huggingface/manual/Qwen3-30B-A3B-FP8`) |
-| Port | `8001` |
-| Footprint | ~7 GB weights + KV cache |
-| Memory utilization | `0.30` (carves ~36 GB — plenty of KV headroom) |
+| Model | `Qwen/Qwen3-30B-A3B` (MoE, ~3B active) |
+| Local path | `/models/Qwen3-30B-A3B` (mounted from `/data/huggingface/manual/Qwen3-30B-A3B`) |
+| Container | `tonic-vllm-qwen-main` |
+| Port | `127.0.0.1:8001` |
+| Image | `hellohal2064/vllm-dgx-spark-gb10:latest` |
+| Served name (LiteLLM alias) | `qwen-main` |
+| Memory utilization | `0.60` (`.env` → `QWEN_MAIN_MEM_UTIL`; carves ~73 GiB out of the 121 GiB unified pool, leaves ~48 GiB for OS + Docker + page cache) |
+| KV cache dtype | `fp8` |
+| `max-model-len` | `32768` |
+| `max-num-batched-tokens` | `8192` |
+| `max-num-seqs` | `64` |
+| Tool-call parser | `hermes` |
+| Reasoning parser | `qwen3` |
+| Thinking mode | `ENABLE_THINKING=true` |
+| Startup | 16 shards × ~3.6 GiB → ~6–7 min cold load. Health probe shows `(health: starting)` for the first ~7 min; confirm with `docker logs tonic-vllm-qwen-main --tail 10`. |
 | Best for | fast reasoning, tool calling, coding, EN/ZH |
 
-The full compose-managed launch is in [`docker-compose.yml`](docker-compose.yml). To run it standalone for debugging:
+The full compose-managed launch is in [`docker-compose.yml`](docker-compose.yml). To run it standalone for debugging, remember the `hellohal2064` env-var contract:
 
 ```bash
 docker run -d \
@@ -461,24 +482,28 @@ docker run -d \
   -p 8001:8000 \
   -e VLLM_USE_TRITON_FLASH_ATTN=1 \
   -e VLLM_ATTENTION_BACKEND=FLASHINFER \
+  -e MODEL_PATH=/models/Qwen3-30B-A3B \
+  -e HOST=0.0.0.0 \
+  -e PORT=8000 \
+  -e MAX_MODEL_LEN=32768 \
+  -e GPU_MEMORY_UTIL=0.60 \
+  -e ATTENTION_BACKEND=FLASHINFER \
+  -e TOOL_CALL_PARSER=hermes \
+  -e REASONING_PARSER=qwen3 \
+  -e ENABLE_THINKING=true \
   -v /data/huggingface:/root/.cache/huggingface \
   -v /data/huggingface/manual:/models:ro \
-  hellohal2064/vllm-dgx-spark-gb10:v0.17.1 \
-  --model /models/Qwen3-30B-A3B-FP8 \
+  hellohal2064/vllm-dgx-spark-gb10:latest \
   --served-model-name qwen-main \
   --tensor-parallel-size 1 \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.30 \
   --kv-cache-dtype fp8 \
   --enable-chunked-prefill \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 64 \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --host 0.0.0.0
+  --disable-log-requests
 ```
 
-**Want a larger model as `qwen-main`?** Manually upload it into `/data/huggingface/manual/<folder>/`, then set `QWEN_MAIN_MODEL=/models/<folder>` and `QWEN_MAIN_MEM_UTIL=0.70` (for 122B) in `.env`, and `docker compose up -d --force-recreate vllm-qwen-main`. All other config stays the same — LiteLLM keeps routing the alias `qwen-main` to whichever model is loaded.
+**Want a larger model as `qwen-main`?** Manually upload it into `/data/huggingface/manual/<folder>/`, then set `QWEN_MAIN_MODEL=/models/<folder>` and (for a 122B-class model) `QWEN_MAIN_MEM_UTIL=0.85` in `.env`, and `docker compose up -d --force-recreate vllm-qwen-main`. All other config stays the same — LiteLLM keeps routing the alias `qwen-main` to whichever model is loaded.
 
 **Smoke test:**
 ```bash
@@ -487,18 +512,23 @@ curl http://localhost:8001/v1/chat/completions \
   -d '{"model":"qwen-main","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
 ```
 
-### 6.2 Backend B — Qwen Vision (NVFP4)
+### 6.2 Backend B — Qwen2.5-VL (`qwen-vision`)
 
 > The originally-requested **Qwen3-VL-235B requires ≥320 GB VRAM** and cannot run on a single GB10. Below is the GB10-feasible vision option. To run a larger vision model, link two Sparks via the ConnectX-7 200 Gb/s port and follow NVIDIA's two-node Spark recipe — out of scope for this guide.
 
+> ⏳ **Status:** in the `optional` Compose profile and **not yet downloaded**. Pending: place `Qwen2.5-VL-7B-Instruct` under `/data/huggingface/manual/`. This service does **not** auto-start.
+
 | | |
 |---|---|
-| Model | `nvidia/Qwen2.5-VL-7B-Instruct-FP4` |
-| Port | `8002` |
-| Footprint | ~6 GB weights + KV cache |
+| Model | `Qwen/Qwen2.5-VL-7B-Instruct` |
+| Local path | `/models/Qwen2.5-VL-7B-Instruct` |
+| Container | `tonic-vllm-qwen-vision` |
+| Port | `127.0.0.1:8002` |
+| Compose profile | `optional` — start with `--profile optional up -d vllm-qwen-vision` |
 | Memory utilization | `0.20` |
 
 ```bash
+# Standalone launch (for debugging). In production start via the optional profile.
 docker run -d \
   --name tonic-vllm-qwen-vision \
   --restart unless-stopped \
@@ -507,12 +537,11 @@ docker run -d \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --shm-size 4g \
   -p 8002:8000 \
-  -e HF_TOKEN=$HF_TOKEN \
   -v /data/huggingface:/root/.cache/huggingface \
-  hellohal2064/vllm-dgx-spark-gb10:v0.17.1 \
-  --model nvidia/Qwen2.5-VL-7B-Instruct-FP4 \
+  -v /data/huggingface/manual:/models:ro \
+  hellohal2064/vllm-dgx-spark-gb10:latest \
+  --model /models/Qwen2.5-VL-7B-Instruct \
   --served-model-name qwen-vision \
-  --quantization modelopt \
   --tensor-parallel-size 1 \
   --max-model-len 32768 \
   --gpu-memory-utilization 0.20 \
@@ -523,45 +552,74 @@ docker run -d \
   --host 0.0.0.0
 ```
 
-### 6.3 Backend C — Gemma4-31B-NVFP4
+### 6.3 Backend C — Gemma4-31B-IT (`gemma4-31b`)
+
+> ⚠️ **Not in an optional Compose profile** — unlike `vllm-qwen-vision`, this is a regular service and simply is not started by default because the GB10 cannot run two vLLM instances at once. Start it explicitly (see [§6.4](#64-running-only-one-vllm-at-a-time)).
+
+> ⚠️ **Currently blocked by an FP8 CUTLASS crash on SM 12.1** (as of 2026-07-05). The `cutlass_scaled_mm` kernel in `vllm/vllm-openai:cu129-nightly-aarch64` faults with `cutlass_gemm_caller Error Internal` after model load, during KV cache warm-up. `--enforce-eager` does **not** work around it. Pending fix: drop `--quantization fp8` and `--kv-cache-dtype fp8` and run native BF16 (will need `GEMMA4_31B_MEM_UTIL≈0.90`+).
 
 | | |
 |---|---|
-| Model | `nvidia/Gemma-4-31B-IT-NVFP4` |
-| Port | `8003` |
-| Footprint | ~22 GB weights |
-| Memory utilization | `0.30` |
-| Best for | low-latency, 131K context, tool calling |
+| Model | `google/gemma-4-31B-it` |
+| Local path | `/models/gemma-4-31B-it` |
+| Container | `tonic-vllm-gemma4-31b` |
+| Port | `127.0.0.1:8003` |
+| Image | `vllm/vllm-openai:cu129-nightly-aarch64` (**not** `${VLLM_IMAGE}` — hellohal2064 only ships Gemma3 support) |
+| Served name | `gemma4-31b` |
+| Memory utilization | `0.35` (`.env` → `GEMMA4_31B_MEM_UTIL`) |
+| `max-model-len` | `32768` |
+| `max-num-batched-tokens` | `4096` |
+| `max-num-seqs` | `32` |
+| `--enforce-eager` | set (disables CUDA graph capture) |
+| Best for | low-latency, tool calling |
 
 ```bash
+# Standalone launch shown for reference — subject to the CUTLASS FP8 crash noted above.
 docker run -d \
-  --name tonic-vllm-gemma-fast \
+  --name tonic-vllm-gemma4-31b \
   --restart unless-stopped \
   --gpus all \
   --ipc host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --shm-size 4g \
   -p 8003:8000 \
-  -e HF_TOKEN=$HF_TOKEN \
   -v /data/huggingface:/root/.cache/huggingface \
-  hellohal2064/vllm-dgx-spark-gb10:v0.17.1 \
-  --model nvidia/Gemma-4-31B-IT-NVFP4 \
-  --served-model-name gemma-fast \
-  --quantization modelopt \
+  -v /data/huggingface/manual:/models:ro \
+  vllm/vllm-openai:cu129-nightly-aarch64 \
+  --model /models/gemma-4-31B-it \
+  --served-model-name gemma4-31b \
   --tensor-parallel-size 1 \
-  --max-model-len 131072 \
-  --gpu-memory-utilization 0.30 \
-  --kv-cache-dtype fp8 \
-  --enable-chunked-prefill \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.35 \
   --max-num-batched-tokens 4096 \
+  --max-num-seqs 32 \
+  --enforce-eager \
+  --enable-chunked-prefill \
   --enable-auto-tool-choice \
   --tool-call-parser gemma4 \
-  --language-model-only \
   --trust-remote-code \
   --host 0.0.0.0
 ```
 
-> **Budget reminder:** the default sum `0.30 + 0.20 + 0.30 = 0.80` fits comfortably alongside the ARM CPU and OS in the 119 GiB usable pool, so all three backends can run concurrently. If you swap `qwen-main` for a 122B/120B model (raising `QWEN_MAIN_MEM_UTIL` to 0.70), you'll need to either lower the vision backend to 0.10 (skip images) or use the `scripts/swap.sh` cold-swap pattern in [§12](#12-maintenance-routine--model-updates).
+### 6.4 Running only one vLLM at a time
+
+Model weights and KV cache alone consume 30–110 GiB per backend, and the GB10's 121 GiB unified pool has to hold the OS, Docker, and page cache as well. Two live vLLM containers reliably OOM during KV warm-up. **In production, run exactly one vLLM service at a time.**
+
+```bash
+# Swap: stop Qwen, start Gemma4
+docker stop tonic-vllm-qwen-main
+docker compose --env-file .env --env-file config/image-versions.env up -d vllm-gemma4-31b
+
+# Swap back: stop Gemma4, start Qwen
+docker stop tonic-vllm-gemma4-31b
+docker compose --env-file .env --env-file config/image-versions.env up -d vllm-qwen-main
+
+# Start the vision profile (still requires stopping whatever is on the GPU first)
+docker stop tonic-vllm-qwen-main
+docker compose --env-file .env --env-file config/image-versions.env --profile optional up -d vllm-qwen-vision
+```
+
+`scripts/swap.sh` in [§12](#12-maintenance-routine--model-updates) wraps this pattern with a health-check gate.
 
 ---
 
@@ -573,6 +631,29 @@ See [`config/litellm_config.yaml`](config/litellm_config.yaml). Key sections:
 - `router_settings` — retries, cooldown, simple-shuffle fallback
 - `general_settings` — master key from env, PostgreSQL DB, Redis cache
 - `litellm_settings` — request timeout 600s for long generations on GB10
+
+### 7.1 LiteLLM health check shows `(unhealthy)` — usually expected
+
+LiteLLM's `/health/liveliness` endpoint can return non-200 even when the proxy is routing requests successfully — it flips to unhealthy whenever **any** entry in `model_list` is unreachable (very common in this deployment because `qwen-vision` and `gemma4-31b` are only up on demand) or during LiteLLM's own startup. The gateway is actually functional as long as `/health` returns a JSON body.
+
+```bash
+# Verify the gateway is really alive (ignore the container's health column)
+curl -s http://127.0.0.1:4000/health | jq .
+
+# List the models LiteLLM currently thinks are online
+curl -s -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  http://127.0.0.1:4000/v1/models | jq '.data[].id'
+```
+
+### 7.2 Container health legend for vLLM
+
+| Status | Meaning |
+|--------|---------|
+| `(healthy)` | Model loaded and accepting requests |
+| `(health: starting)` | Still loading shards — normal for the first 7–10 min on `qwen-main` |
+| `(unhealthy)` | Either still loading beyond the start-period, or crashed — check `docker logs <container> --tail 20` |
+
+GPU clock idles at ~300 MHz and jumps to ~2444 MHz once inference actually begins.
 
 ---
 
@@ -661,9 +742,9 @@ The GB10 is **memory-bandwidth-bound** (273 GB/s), not compute-bound. Tuning is 
 | `--kv-cache-dtype` | `auto` (fp16) | **`fp8`** | Halves KV bandwidth — single biggest GB10 throughput win |
 | `--quantization` | (model default) | **`modelopt` (NVFP4)** when available | 4-bit weights → 4× less memory traffic |
 | `--enable-chunked-prefill` | off | **on** | Interleaves long-prompt prefill with decode → eliminates head-of-line blocking |
-| `--max-num-batched-tokens` | 2048 | **8192** for 122B; **4096** for 31B | Bigger batches saturate tensor cores |
-| `--max-num-seqs` | 256 | **32** (122B), **64** (31B), **128** (7B) | Concurrent-request ceiling; lower on bigger models |
-| `--gpu-memory-utilization` | 0.90 | **0.70 / 0.30 / 0.20** for A/C/B | Leaves headroom on the *shared* pool |
+| `--max-num-batched-tokens` | 2048 | **8192** for `qwen-main` (30B); **4096** for `gemma4-31b` / `qwen-vision` | Bigger batches saturate tensor cores |
+| `--max-num-seqs` | 256 | **64** (`qwen-main`), **32** (`gemma4-31b`), **16** (`qwen-vision`) | Concurrent-request ceiling; only one vLLM runs at a time so these don't have to sum |
+| `--gpu-memory-utilization` | 0.90 | **0.60 / 0.35 / 0.20** for A / C / B (only one active at a time) | Leaves headroom on the *shared* pool |
 | `--max-model-len` | (model default) | **32768 / 131072 / 32768** | Long-context costs KV cache; only buy what you need |
 | `VLLM_ATTENTION_BACKEND` | auto | **`FLASHINFER`** | The only attention backend that's actually verified on SM 12.1 |
 | `--enforce-eager` | false | **false** (leave it off) | CUDA graphs give a 15–25 % decode boost on Blackwell |
@@ -727,15 +808,15 @@ litellm_settings:
     ttl: 600
 ```
 
-### 10.5 Expected ballpark on GB10 (Qwen3-30B-A3B-FP8, fp8 KV, batch 32)
+### 10.5 Expected ballpark on GB10 (Qwen3-30B-A3B, fp8 KV, batch 32)
 
 | Phase | Tokens / s |
 |-------|------------|
-| Qwen3-30B-A3B-FP8 prefill | ~3,500 t/s |
-| Qwen3-30B-A3B-FP8 decode (single) | ~110–130 t/s |
-| Qwen3-30B-A3B-FP8 decode (batch 16 concurrent) | ~700–850 t/s aggregate |
-| Gemma4-31B-NVFP4 decode | ~50–60 t/s single seq |
-| Qwen2.5-VL-7B-FP4 decode | ~80–100 t/s single seq |
+| Qwen3-30B-A3B prefill | ~3,500 t/s |
+| Qwen3-30B-A3B decode (single) | ~110–130 t/s |
+| Qwen3-30B-A3B decode (batch 16 concurrent) | ~700–850 t/s aggregate |
+| Gemma4-31B-IT decode (BF16, once FP8 unblocked) | ~50–60 t/s single seq |
+| Qwen2.5-VL-7B decode | ~80–100 t/s single seq |
 | (Optional) Qwen3.5-122B-A10B-FP8 decode (single) | ~38–42 t/s |
 
 Full methodology and how to reproduce: [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md).
@@ -811,13 +892,13 @@ docker images --filter "dangling=true" -q | xargs -r docker rmi
 
 # 2. Snapshot current model dirs (in case the new revision regresses)
 # For manually-uploaded models — archive the folder before overwriting
-mv /data/huggingface/manual/Qwen3-30B-A3B-FP8 \
-   /data/huggingface/hub/_archive/Qwen3-30B-A3B-FP8.$(date +%Y%m%d)
+mv /data/huggingface/manual/Qwen3-30B-A3B \
+   /data/huggingface/hub/_archive/Qwen3-30B-A3B.$(date +%Y%m%d)
 
 # 3. Re-upload the fresh copy from your laptop
-# rsync -avhP ~/Downloads/Qwen3-30B-A3B-FP8/ \
-#   tony@spark.<tailnet>.ts.net:/data/huggingface/manual/Qwen3-30B-A3B-FP8/
-scripts/verify-model.sh /data/huggingface/manual/Qwen3-30B-A3B-FP8
+# rsync -avhP ~/Downloads/Qwen3-30B-A3B/ \
+#   tony@spark.<tailnet>.ts.net:/data/huggingface/manual/Qwen3-30B-A3B/
+scripts/verify-model.sh /data/huggingface/manual/Qwen3-30B-A3B
 
 # 4. Canary
 docker compose -f docker-compose.yml -f docker-compose.canary.yml up -d vllm-qwen-main-canary
@@ -850,7 +931,7 @@ model_list:
       load_on_demand: true                # custom flag handled by scripts/swap.sh
 ```
 
-`scripts/swap.sh qwen-main → gemma-fast` stops one container and starts the other in <60 s.
+`scripts/swap.sh qwen-main → gemma4-31b` stops one container and starts the other in <60 s. This is the same pattern documented in [§6.4](#64-running-only-one-vllm-at-a-time) — the two backends cannot be co-resident.
 
 ---
 
@@ -945,7 +1026,7 @@ A Spark has one GB10. TP > 1 requires multiple GPUs.
 Don't. On the shared pool, 0.90 leaves only ~12 GB for the ARM CPU, OS, page cache, and any other backend. Stick to the §6 budgets.
 
 **Q: My agent works in Cantonese — which model should it use?**
-`qwen-main` (Qwen3-30B-A3B-FP8 by default). Qwen is trained heavily on ZH/EN and is strong in Cantonese. For maximum quality on complex Cantonese requests, swap to Qwen3.5-122B via `QWEN_MAIN_MODEL` (see §6.1).
+`qwen-main` (Qwen3-30B-A3B by default). Qwen is trained heavily on ZH/EN and is strong in Cantonese. For maximum quality on complex Cantonese requests, swap to Qwen3.5-122B via `QWEN_MAIN_MODEL` (see §6.1). Remember only one vLLM can run at a time, so any swap-in evicts whatever was running before ([§6.4](#64-running-only-one-vllm-at-a-time)).
 
 **Q: How do I add GPT-5 / Claude as a fallback?**
 Uncomment the cloud entries in `config/litellm_config.yaml` and set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` in `.env`. Restart LiteLLM: `docker compose restart litellm`.
@@ -959,13 +1040,15 @@ LiteLLM UI → **Virtual Keys** → **Create Key**, or:
 curl -X POST http://localhost:4000/key/generate \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"key_alias":"agent-coder","models":["qwen-main","gemma-fast"],"max_budget":100,"tpm_limit":50000,"rpm_limit":60}'
+  -d '{"key_alias":"agent-coder","models":["qwen-main","gemma4-31b"],"max_budget":100,"tpm_limit":50000,"rpm_limit":60}'
 ```
 
 ---
 
 ## Documentation Index
 
+- [docs/VLLM-SETUP.md](docs/VLLM-SETUP.md) — production vLLM backend reference (memory tuning, hellohal2064 env-var contract, one-vLLM-at-a-time workflow, LiteLLM health quirk)
+- [docs/MANUAL_MODEL_UPLOAD.md](docs/MANUAL_MODEL_UPLOAD.md) — HF web-download → rsync upload workflow
 - [docs/VERSIONING.md](docs/VERSIONING.md) — full version-control strategy
 - [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) — every tunable parameter explained
 - [docs/MAINTENANCE.md](docs/MAINTENANCE.md) — weekly / monthly / quarterly schedule
