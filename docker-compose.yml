@@ -208,8 +208,12 @@ services:
     networks: [tonic]
 
   # ── vLLM Backend C — Gemma4-31B-IT (BF16) ────────────────────────────────
+  # ⚠️ BLOCKED: requires transformers 5.x + vLLM with Gemma4 registry
+  # Current image (hellohal2064/vllm-dgx-spark-gb10:latest, Feb 2026) only supports Gemma3.
+  # Re-enable when image is updated.
   vllm-gemma-fast:
     <<: *vllm-common
+    profiles: ["optional"]
     container_name: tonic-vllm-gemma-fast
     ports:
       - "127.0.0.1:8003:8000"
